@@ -16,6 +16,10 @@ constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kTimer = 1;
 constexpr UINT kOpen = 1001;
 constexpr UINT kExit = 1002;
+constexpr int kActiveList = 1101;
+constexpr int kInactiveList = 1102;
+constexpr int kTagEdit = 1103;
+constexpr int kSaveTag = 1104;
 constexpr UINT_PTR kTrayId = 1;
 constexpr uint64_t kTicksPerMs = 10000;
 constexpr uint64_t kTicksPerDay = 864000000000ULL;
@@ -178,8 +182,10 @@ public:
             std::wstring name(path + (slash == std::wstring::npos ? 0 : slash + 1));
             try {
                 auto it = apps_.find(key);
-                if (it == apps_.end())
+                if (it == apps_.end()) {
+                    db_.EnsureApp(key, name);
                     it = apps_.emplace(key, App{name, now, {}, NewRunId()}).first;
+                }
                 it->second.processes.push_back({pid, handle});
             } catch (...) {
                 CloseHandle(handle);
@@ -187,6 +193,7 @@ public:
             }
         }
     }
+    bool IsActive(const std::wstring& path) const { return apps_.find(path) != apps_.end(); }
     void Flush(uint64_t now) {
         struct Update { std::wstring path; uint64_t end; std::vector<DWORD> exited; };
         std::vector<Update> updates;
@@ -253,7 +260,18 @@ class Application {
     Database db_;
     Tracker tracker_;
     HWND window_ = nullptr;
-    HWND list_ = nullptr;
+    HWND activeList_ = nullptr;
+    HWND inactiveList_ = nullptr;
+    HWND activeLabel_ = nullptr;
+    HWND inactiveLabel_ = nullptr;
+    HWND tagLabel_ = nullptr;
+    HWND tagEdit_ = nullptr;
+    HWND saveTag_ = nullptr;
+    std::vector<Row> activeRows_;
+    std::vector<Row> inactiveRows_;
+    int64_t selectedId_ = 0;
+    bool hasSelection_ = false;
+    bool updatingLists_ = false;
     bool tray_ = false;
     UINT taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
     NOTIFYICONDATAW icon_{};
@@ -270,21 +288,102 @@ class Application {
             throw std::runtime_error("Could not add the MinTracker notification icon.");
         tray_ = true;
     }
-    void Refresh() {
-        auto rows = db_.Rows(Date(LocalAt(Now())));
-        ListView_DeleteAllItems(list_);
+    HWND CreateList(int id) {
+        HWND list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+            GetModuleHandleW(nullptr), nullptr);
+        if (!list) throw WinError("Could not create application list");
+        ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        const wchar_t* names[] = {L"Application", L"Total runtime", L"Today's runtime", L"Tag", L"Path"};
+        const int widths[] = {180, 110, 110, 130, 300};
+        for (int i = 0; i < 5; ++i) {
+            LVCOLUMNW column{};
+            column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+            column.pszText = const_cast<wchar_t*>(names[i]);
+            column.cx = widths[i];
+            column.iSubItem = i;
+            if (ListView_InsertColumn(list, i, &column) < 0)
+                throw std::runtime_error("Could not create list column.");
+        }
+        return list;
+    }
+    void Populate(HWND list, const std::vector<Row>& rows) {
+        int top = ListView_GetTopIndex(list);
+        bool focused = GetFocus() == list;
+        ListView_DeleteAllItems(list);
         for (size_t i = 0; i < rows.size(); ++i) {
             LVITEMW item{};
             item.mask = LVIF_TEXT;
             item.iItem = static_cast<int>(i);
             item.pszText = const_cast<wchar_t*>(rows[i].name.c_str());
-            int index = ListView_InsertItem(list_, &item);
+            int index = ListView_InsertItem(list, &item);
             if (index < 0) throw std::runtime_error("Could not update the application list.");
             std::wstring total = FormatDuration(rows[i].total);
             std::wstring today = FormatDuration(rows[i].today);
-            ListView_SetItemText(list_, index, 1, &total[0]);
-            ListView_SetItemText(list_, index, 2, &today[0]);
+            ListView_SetItemText(list, index, 1, &total[0]);
+            ListView_SetItemText(list, index, 2, &today[0]);
+            ListView_SetItemText(list, index, 3, const_cast<wchar_t*>(rows[i].tag.c_str()));
+            ListView_SetItemText(list, index, 4, const_cast<wchar_t*>(rows[i].path.c_str()));
+            if (hasSelection_ && rows[i].id == selectedId_) {
+                UINT state = LVIS_SELECTED | (focused ? LVIS_FOCUSED : 0);
+                ListView_SetItemState(list, index, state, LVIS_SELECTED | LVIS_FOCUSED);
+            }
         }
+        if (top > 0 && !rows.empty()) {
+            RECT rect{};
+            if (ListView_GetItemRect(list, 0, &rect, LVIR_BOUNDS))
+                ListView_Scroll(list, 0, (std::min)(top, static_cast<int>(rows.size()) - 1) * (rect.bottom - rect.top));
+        }
+    }
+    void Refresh() {
+        auto rows = db_.Rows(Date(LocalAt(Now())));
+        activeRows_.clear();
+        inactiveRows_.clear();
+        for (auto& row : rows) {
+            if (tracker_.IsActive(row.path)) activeRows_.push_back(std::move(row));
+            else inactiveRows_.push_back(std::move(row));
+        }
+        updatingLists_ = true;
+        Populate(activeList_, activeRows_);
+        Populate(inactiveList_, inactiveRows_);
+        updatingLists_ = false;
+    }
+    void SelectRow(HWND list, int index) {
+        const auto& rows = list == activeList_ ? activeRows_ : inactiveRows_;
+        if (index < 0 || static_cast<size_t>(index) >= rows.size()) return;
+        updatingLists_ = true;
+        HWND other = list == activeList_ ? inactiveList_ : activeList_;
+        ListView_SetItemState(other, -1, 0, LVIS_SELECTED);
+        updatingLists_ = false;
+        selectedId_ = rows[static_cast<size_t>(index)].id;
+        hasSelection_ = true;
+        SetWindowTextW(tagEdit_, rows[static_cast<size_t>(index)].tag.c_str());
+        EnableWindow(tagEdit_, TRUE);
+        EnableWindow(saveTag_, TRUE);
+    }
+    void SaveTag() {
+        if (!hasSelection_) return;
+        int length = GetWindowTextLengthW(tagEdit_);
+        std::wstring tag(static_cast<size_t>(length) + 1, L'\0');
+        int copied = GetWindowTextW(tagEdit_, &tag[0], length + 1);
+        tag.resize(static_cast<size_t>(copied));
+        db_.SetTag(selectedId_, tag);
+        Refresh();
+    }
+    void Layout(int width, int height) {
+        if (!activeList_ || !inactiveList_ || !tagEdit_) return;
+        int contentWidth = (std::max)(0, width - 16);
+        int panelHeight = (std::max)(0, (height - 110) / 2);
+        MoveWindow(activeLabel_, 8, 8, contentWidth, 20, TRUE);
+        MoveWindow(activeList_, 8, 28, contentWidth, panelHeight, TRUE);
+        int second = 36 + panelHeight;
+        MoveWindow(inactiveLabel_, 8, second, contentWidth, 20, TRUE);
+        MoveWindow(inactiveList_, 8, second + 20, contentWidth, panelHeight, TRUE);
+        int bottom = second + 28 + panelHeight;
+        MoveWindow(tagLabel_, 8, bottom + 4, 30, 20, TRUE);
+        MoveWindow(tagEdit_, 40, bottom, (std::max)(0, width - 140), 26, TRUE);
+        MoveWindow(saveTag_, (std::max)(40, width - 92), bottom, 84, 26, TRUE);
     }
     void Tick() {
         uint64_t now = Now();
@@ -314,29 +413,67 @@ class Application {
         if (message == taskbarCreated_) { tray_ = false; AddTray(); return 0; }
         switch (message) {
         case WM_CREATE: {
-            list_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
-                0, 0, 0, 0, window_, nullptr, GetModuleHandleW(nullptr), nullptr);
-            if (!list_) throw WinError("Could not create application list");
-            ListView_SetExtendedListViewStyle(list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-            const wchar_t* names[] = {L"Application", L"Total runtime", L"Today's runtime"};
-            const int widths[] = {270, 150, 150};
-            for (int i = 0; i < 3; ++i) {
-                LVCOLUMNW column{};
-                column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-                column.pszText = const_cast<wchar_t*>(names[i]);
-                column.cx = widths[i];
-                column.iSubItem = i;
-                if (ListView_InsertColumn(list_, i, &column) < 0)
-                    throw std::runtime_error("Could not create list column.");
-            }
+            HINSTANCE instance = GetModuleHandleW(nullptr);
+            activeLabel_ = CreateWindowW(L"STATIC", L"Active apps", WS_CHILD | WS_VISIBLE,
+                0, 0, 0, 0, window_, nullptr, instance, nullptr);
+            activeList_ = CreateList(kActiveList);
+            inactiveLabel_ = CreateWindowW(L"STATIC", L"Inactive apps", WS_CHILD | WS_VISIBLE,
+                0, 0, 0, 0, window_, nullptr, instance, nullptr);
+            inactiveList_ = CreateList(kInactiveList);
+            tagLabel_ = CreateWindowW(L"STATIC", L"Tag:", WS_CHILD | WS_VISIBLE,
+                0, 0, 0, 0, window_, nullptr, instance, nullptr);
+            tagEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTagEdit)), instance, nullptr);
+            saveTag_ = CreateWindowW(L"BUTTON", L"Save tag", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveTag)), instance, nullptr);
+            if (!activeLabel_ || !inactiveLabel_ || !tagLabel_ || !tagEdit_ || !saveTag_)
+                throw WinError("Could not create app controls");
+            HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            for (HWND control : {activeLabel_, activeList_, inactiveLabel_, inactiveList_,
+                                 tagLabel_, tagEdit_, saveTag_})
+                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            EnableWindow(tagEdit_, FALSE);
+            EnableWindow(saveTag_, FALSE);
+            RECT client{};
+            GetClientRect(window_, &client);
+            Layout(client.right, client.bottom);
             AddTray();
             Tick();
             if (!SetTimer(window_, kTimer, 2000, nullptr)) throw WinError("Could not start tracking timer");
             return 0;
         }
         case WM_SIZE:
-            if (list_) MoveWindow(list_, 0, 0, LOWORD(lparam), HIWORD(lparam), TRUE);
+            Layout(LOWORD(lparam), HIWORD(lparam));
+            return 0;
+        case WM_GETMINMAXINFO: {
+            auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+            info->ptMinTrackSize.x = 450;
+            info->ptMinTrackSize.y = 300;
+            return 0;
+        }
+        case WM_NOTIFY: {
+            auto* header = reinterpret_cast<NMHDR*>(lparam);
+            if (!updatingLists_ && header->code == LVN_ITEMCHANGED &&
+                (header->hwndFrom == activeList_ || header->hwndFrom == inactiveList_)) {
+                auto* change = reinterpret_cast<NMLISTVIEW*>(lparam);
+                if ((change->uChanged & LVIF_STATE) &&
+                    (change->uNewState & LVIS_SELECTED) && !(change->uOldState & LVIS_SELECTED))
+                    SelectRow(header->hwndFrom, change->iItem);
+                else if ((change->uChanged & LVIF_STATE) &&
+                         (change->uOldState & LVIS_SELECTED) && !(change->uNewState & LVIS_SELECTED) &&
+                         ListView_GetNextItem(activeList_, -1, LVNI_SELECTED) < 0 &&
+                         ListView_GetNextItem(inactiveList_, -1, LVNI_SELECTED) < 0) {
+                    hasSelection_ = false;
+                    SetWindowTextW(tagEdit_, L"");
+                    EnableWindow(tagEdit_, FALSE);
+                    EnableWindow(saveTag_, FALSE);
+                }
+            }
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wparam) == kSaveTag && HIWORD(wparam) == BN_CLICKED) SaveTag();
             return 0;
         case WM_TIMER:
             if (wparam == kTimer) Tick();
@@ -406,8 +543,10 @@ public:
         MSG message{};
         int result;
         while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
+            if (!IsDialogMessageW(window, &message)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
         }
         if (result == -1) throw WinError("Windows message loop failed");
         return static_cast<int>(message.wParam);

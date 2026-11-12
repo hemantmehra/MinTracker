@@ -111,9 +111,7 @@ void Database::Exec(const char* sql) {
     }
 }
 
-void Database::Add(const std::wstring& path, const std::wstring& name,
-                   const std::wstring& runId, const std::wstring& day, int64_t milliseconds) {
-    if (milliseconds <= 0) return;
+void Database::EnsureApp(const std::wstring& path, const std::wstring& name) {
     Statement insertApp(db_, "INSERT OR IGNORE INTO apps(path,name) VALUES(?1,?2)");
     insertApp.Text(1, path);
     insertApp.Text(2, name);
@@ -122,6 +120,21 @@ void Database::Add(const std::wstring& path, const std::wstring& name,
     updateApp.Text(1, path);
     updateApp.Text(2, name);
     updateApp.Done(db_);
+}
+
+void Database::SetTag(int64_t id, const std::wstring& tag) {
+    Statement update(db_, "UPDATE apps SET tag=?2 WHERE id=?1");
+    update.Integer(1, id);
+    update.Text(2, tag);
+    update.Done(db_);
+    if (sqlite3_changes(db_) != 1)
+        throw std::runtime_error("Could not save tag: application no longer exists.");
+}
+
+void Database::Add(const std::wstring& path, const std::wstring& name,
+                   const std::wstring& runId, const std::wstring& day, int64_t milliseconds) {
+    if (milliseconds <= 0) return;
+    EnsureApp(path, name);
     Statement insertDaily(db_, "INSERT OR IGNORE INTO daily_usage(app_id,run_id,day,duration_ms) "
                                "SELECT id,?2,?3,0 FROM apps WHERE path=?1");
     insertDaily.Text(1, path);
@@ -138,7 +151,7 @@ void Database::Add(const std::wstring& path, const std::wstring& name,
 }
 
 std::vector<Row> Database::Rows(const std::wstring& day) {
-    Statement query(db_, "SELECT a.name,COALESCE(SUM(d.duration_ms),0),"
+    Statement query(db_, "SELECT a.id,a.path,a.name,a.tag,COALESCE(SUM(d.duration_ms),0),"
                          "COALESCE(SUM(CASE WHEN d.day=?1 THEN d.duration_ms ELSE 0 END),0) "
                          "FROM apps a LEFT JOIN daily_usage d ON d.app_id=a.id "
                          "GROUP BY a.id "
@@ -147,10 +160,12 @@ std::vector<Row> Database::Rows(const std::wstring& day) {
     std::vector<Row> rows;
     int result;
     while ((result = sqlite3_step(query.value)) == SQLITE_ROW) {
-        const auto* name = static_cast<const wchar_t*>(sqlite3_column_text16(query.value, 0));
-        if (!name) throw std::runtime_error("Could not read app name from SQLite.");
-        rows.push_back({name, sqlite3_column_int64(query.value, 1),
-                        sqlite3_column_int64(query.value, 2)});
+        const auto* path = static_cast<const wchar_t*>(sqlite3_column_text16(query.value, 1));
+        const auto* name = static_cast<const wchar_t*>(sqlite3_column_text16(query.value, 2));
+        const auto* tag = static_cast<const wchar_t*>(sqlite3_column_text16(query.value, 3));
+        if (!path || !name || !tag) throw std::runtime_error("Could not read app details from SQLite.");
+        rows.push_back({sqlite3_column_int64(query.value, 0), path, name, tag,
+                        sqlite3_column_int64(query.value, 4), sqlite3_column_int64(query.value, 5)});
     }
     if (result != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(db_));
     return rows;

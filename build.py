@@ -93,7 +93,7 @@ def main():
         str(ROOT / "src" / "main.cpp"), str(ROOT / "src" / "database.cpp"),
         "/Fo" + str(OUTPUT) + os.sep,
         "/Fe" + str(executable), "/link", "/SUBSYSTEM:WINDOWS",
-        "user32.lib", "comctl32.lib", "shell32.lib", "ole32.lib", "winsqlite3.lib",
+        "user32.lib", "gdi32.lib", "comctl32.lib", "shell32.lib", "ole32.lib", "winsqlite3.lib",
     ]
     subprocess.run(command, cwd=ROOT, env=environment, check=True)
     print(f"Built {executable}")
