@@ -135,19 +135,15 @@ void Database::Add(const std::wstring& path, const std::wstring& name,
                    const std::wstring& runId, const std::wstring& day, int64_t milliseconds) {
     if (milliseconds <= 0) return;
     EnsureApp(path, name);
-    Statement insertDaily(db_, "INSERT OR IGNORE INTO daily_usage(app_id,run_id,day,duration_ms) "
-                               "SELECT id,?2,?3,0 FROM apps WHERE path=?1");
+    Statement insertDaily(db_, "INSERT INTO daily_usage(app_id,run_id,day,duration_ms) "
+                               "SELECT id,?2,?3,?4 FROM apps WHERE path=?1");
     insertDaily.Text(1, path);
     insertDaily.Text(2, runId);
     insertDaily.Text(3, day);
+    insertDaily.Integer(4, milliseconds);
     insertDaily.Done(db_);
-    Statement updateDaily(db_, "UPDATE daily_usage SET duration_ms=duration_ms+?4 "
-                               "WHERE app_id=(SELECT id FROM apps WHERE path=?1) AND run_id=?2 AND day=?3");
-    updateDaily.Text(1, path);
-    updateDaily.Text(2, runId);
-    updateDaily.Text(3, day);
-    updateDaily.Integer(4, milliseconds);
-    updateDaily.Done(db_);
+    if (sqlite3_changes(db_) != 1)
+        throw std::runtime_error("Could not insert app usage.");
 }
 
 std::vector<Row> Database::Rows(const std::wstring& day) {

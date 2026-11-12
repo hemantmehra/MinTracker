@@ -123,7 +123,8 @@ struct Process {
 };
 struct App {
     std::wstring name;
-    uint64_t last;
+    uint64_t start;
+    uint64_t displayedUntil;
     std::vector<Process> processes;
     std::wstring runId;
 };
@@ -188,7 +189,7 @@ public:
                 auto it = apps_.find(key);
                 if (it == apps_.end()) {
                     db_.EnsureApp(key, name);
-                    it = apps_.emplace(key, App{name, now, {}, NewRunId()}).first;
+                    it = apps_.emplace(key, App{name, now, now, {}, NewRunId()}).first;
                 }
                 it->second.processes.push_back({pid, handle});
             } catch (...) {
@@ -198,6 +199,26 @@ public:
         }
     }
     bool IsActive(const std::wstring& path) const { return apps_.find(path) != apps_.end(); }
+    void UpdateDisplay(uint64_t now) {
+        for (auto& pair : apps_)
+            pair.second.displayedUntil = (std::max)(pair.second.start, now);
+    }
+    void AddDisplayedUsage(Row& row, const std::wstring& today) const {
+        auto it = apps_.find(row.path);
+        if (it == apps_.end()) return;
+        uint64_t begin = it->second.start;
+        uint64_t end = it->second.displayedUntil;
+        while (begin < end) {
+            SYSTEMTIME local = LocalAt(begin);
+            uint64_t boundary = NextMidnight(local);
+            if (boundary <= begin) throw std::runtime_error("Invalid local midnight boundary.");
+            uint64_t next = (std::min)(boundary, end);
+            int64_t duration = static_cast<int64_t>((next - begin) / kTicksPerMs);
+            row.total += duration;
+            if (Date(local) == today) row.today += duration;
+            begin = next;
+        }
+    }
     void Flush(uint64_t now, bool includeRunning = true) {
         struct Update { std::wstring path; uint64_t end; std::vector<DWORD> exited; };
         std::vector<Update> updates;
@@ -225,8 +246,8 @@ public:
         try {
             for (const auto& update : updates) {
                 const App& app = apps_.at(update.path);
-                if (update.end > app.last)
-                    AddInterval(db_, update.path, app.name, app.runId, app.last, update.end);
+                if (update.end > app.start)
+                    AddInterval(db_, update.path, app.name, app.runId, app.start, update.end);
             }
             db_.Exec("COMMIT");
         } catch (...) {
@@ -237,7 +258,6 @@ public:
         }
         for (const auto& update : updates) {
             App& app = apps_.at(update.path);
-            app.last = (std::max)(app.last, update.end);
             auto it = app.processes.begin();
             while (it != app.processes.end()) {
                 if (std::find(update.exited.begin(), update.exited.end(), it->pid) != update.exited.end()) {
@@ -366,12 +386,16 @@ class Application {
         }
     }
     void Refresh() {
-        auto rows = db_.Rows(Date(LocalAt(Now())));
+        std::wstring today = Date(LocalAt(Now()));
+        auto rows = db_.Rows(today);
         std::wstring search = ControlText(searchEdit_);
         activeRows_.clear();
         inactiveRows_.clear();
         for (auto& row : rows) {
-            if (tracker_.IsActive(row.path)) activeRows_.push_back(std::move(row));
+            if (tracker_.IsActive(row.path)) {
+                tracker_.AddDisplayedUsage(row, today);
+                activeRows_.push_back(std::move(row));
+            }
             else if (ContainsIgnoreCase(row.name, search) || ContainsIgnoreCase(row.tag, search))
                 inactiveRows_.push_back(std::move(row));
         }
@@ -426,7 +450,9 @@ class Application {
         Refresh();
     }
     void UpdateUsage() {
-        tracker_.Flush(Now());
+        uint64_t now = Now();
+        tracker_.Flush(now, false);
+        tracker_.UpdateDisplay(now);
         Refresh();
     }
     void Show() {
@@ -620,7 +646,7 @@ int SelfTest() {
     db.Exec("BEGIN IMMEDIATE");
     AddInterval(db, L"c:\\test\\app.exe", L"app.exe", L"run-1",
                 midnight - 2000 * kTicksPerMs, midnight + 3000 * kTicksPerMs);
-    db.Add(L"c:\\test\\app.exe", L"app.exe", L"run-2", second, 1000);
+    db.Add(L"c:\\test\\app.exe", L"app.exe", L"run-3", second, 1000);
     db.Exec("COMMIT");
     auto before = db.Rows(first);
     auto after = db.Rows(second);

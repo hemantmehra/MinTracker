@@ -165,6 +165,12 @@ def records(path, executable):
         ).fetchall()
 
 
+def app_tag(path, executable):
+    with closing(sqlite3.connect(path)) as db:
+        row = db.execute("SELECT tag FROM apps WHERE path=? COLLATE NOCASE", (executable,)).fetchone()
+    return row[0] if row else None
+
+
 def duration_text(milliseconds):
     seconds = milliseconds // 1000
     return f"{seconds // 3600}:{seconds // 60 % 60:02}:{seconds % 60:02}"
@@ -196,11 +202,16 @@ def main():
             started_at = time.monotonic()
             processes.append(tracker)
             window = wait_for(lambda: user32.FindWindowW("MinTrackerWindow", None), "tracker window")
-            assert user32.IsWindowVisible(window)
+            wait_for(lambda: user32.IsWindowVisible(window), "tracker window to become visible")
             with closing(sqlite3.connect(database)) as db:
                 assert db.execute("PRAGMA user_version").fetchone()[0] == 1
                 assert db.execute("SELECT COUNT(*) FROM apps WHERE path='legacy-test'").fetchone()[0] == 0
                 assert "total_ms" not in {row[1] for row in db.execute("PRAGMA table_info(apps)")}
+                db.execute(
+                    "CREATE TRIGGER forbid_usage_updates BEFORE UPDATE ON daily_usage "
+                    "BEGIN SELECT RAISE(ABORT, 'usage rows must not be updated'); END"
+                )
+                db.commit()
             active_list = user32.GetDlgItem(window, 1101)
             inactive_list = user32.GetDlgItem(window, 1102)
             tag_edit = user32.GetDlgItem(window, 1103)
@@ -223,18 +234,17 @@ def main():
             assert usage(database, executable) is None, "Runtime was saved before the minute update"
             index = reader.index(active_list, executable)
             assert reader.text(active_list, index, 1) == "0:00:00", "Runtime display updated early"
-            first = wait_for(lambda: usage(database, executable), "minute usage update", timeout=75)
-            elapsed = time.monotonic() - started_at
-            assert 58 <= elapsed < 75, f"Unexpected first update time: {elapsed}"
-            assert first[0] == first[1] and 50000 <= first[0] <= 65000
-            first_records = records(database, executable)
-            assert len(first_records) == 1 and first_records[0][4] == ""
-            datetime.datetime.strptime(first_records[0][3], "%Y-%m-%dT%H:%M:%S.%fZ")
             index = wait_for(
                 lambda: (i + 1 if (i := reader.index(active_list, executable)) >= 0
                          and reader.text(active_list, i, 1) != "0:00:00" else None),
-                "minute runtime display",
+                "minute runtime display", timeout=75,
             ) - 1
+            elapsed = time.monotonic() - started_at
+            assert 58 <= elapsed < 75, f"Unexpected first update time: {elapsed}"
+            first = reader.text(active_list, index, 1)
+            assert 50 <= int(first.split(":")[1]) * 60 + int(first.split(":")[2]) <= 65
+            assert reader.text(active_list, index, 2) == first
+            assert usage(database, executable) is None, "Runtime was saved before app exit"
             reader.select(active_list, index)
             assert user32.IsWindowEnabled(tag_edit) and user32.IsWindowEnabled(save_tag), "Selection did not enable tag editor"
             assert field_text(tag_edit) == ""
@@ -243,18 +253,16 @@ def main():
             assert field_text(tag_edit) == "active \u03a9", "Refresh overwrote unsaved edit"
             assert user32.IsWindowEnabled(save_tag), "Refresh disabled tag editor"
             user32.SendMessageW(window, WM_COMMAND, 1104, save_tag)
-            wait_for(lambda: records(database, executable)[0][4] == "active \u03a9", "active tag save")
+            wait_for(lambda: app_tag(database, executable) == "active \u03a9", "active tag save")
             index = reader.index(active_list, executable)
             assert index >= 0 and reader.text(active_list, index, 3) == "active \u03a9"
-            first = usage(database, executable)
 
             other_title = f"MinTracker second test app {os.getpid()}"
             other = subprocess.Popen([sys.executable, __file__, "--window", other_title])
             processes.append(other)
             other_window = wait_for(lambda: user32.FindWindowW(None, other_title), "second test app")
             time.sleep(6)
-            overlap = usage(database, executable)
-            assert overlap == first, "Running app updated before the next minute"
+            assert usage(database, executable) is None, "Running app wrote usage"
 
             post(window, WM_CLOSE)
             wait_for(lambda: not user32.IsWindowVisible(window), "window to hide")
@@ -262,24 +270,24 @@ def main():
             post(child_window, WM_CLOSE)
             assert child.wait(timeout=10) == 0
             time.sleep(3)
-            assert usage(database, executable) == overlap, "Overlapping process exit updated running app"
+            assert usage(database, executable) is None, "Overlapping process exit wrote usage"
             assert reader.index(active_list, executable) >= 0
             second = wait_for(
-                lambda: (row if (row := usage(database, executable)) and row[0] > overlap[0] else None),
-                "second minute update while hidden",
+                lambda: (value if (i := reader.index(active_list, executable)) >= 0
+                         and (value := reader.text(active_list, i, 1)) != first else None),
+                "second minute display update while hidden",
                 timeout=70,
             )
-            assert 55000 <= second[0] - overlap[0] <= 65000, "Minute or overlap accounting incorrect"
-            index = reader.index(active_list, executable)
-            wait_for(lambda: reader.text(active_list, reader.index(active_list, executable), 1)
-                     == duration_text(second[0]), "second minute runtime display")
+            assert usage(database, executable) is None, "Minute update wrote usage"
+            def seconds(value):
+                hours, minutes, seconds_part = map(int, value.split(":"))
+                return hours * 3600 + minutes * 60 + seconds_part
+            assert 55 <= seconds(second) - seconds(first) <= 65, "Minute or overlap accounting incorrect"
+            exit_time = datetime.datetime.now(datetime.timezone.utc)
             post(other_window, WM_CLOSE)
             assert other.wait(timeout=10) == 0
-            final = wait_for(
-                lambda: (row if (row := usage(database, executable)) and row[0] > second[0] else None),
-                "exit accounting",
-            )
-            assert final[0] - second[0] < 10000, "Exit accounting included excessive runtime"
+            final = wait_for(lambda: usage(database, executable), "exit accounting")
+            assert 0 <= final[0] - seconds(second) * 1000 < 10000, "Exit accounting included excessive runtime"
             time.sleep(5)
             stopped = usage(database, executable)
             assert stopped[0] >= final[0]
@@ -287,7 +295,9 @@ def main():
             assert usage(database, executable) == stopped, "Runtime increased after app exit"
             run_records = records(database, executable)
             assert len(run_records) == 1 and run_records[0][2] == stopped[0]
-            assert run_records[0][3] == first_records[0][3], "Insertion timestamp changed"
+            timestamp = datetime.datetime.strptime(run_records[0][3], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=datetime.timezone.utc)
+            assert abs((timestamp - exit_time).total_seconds()) < 10, "Timestamp is not insertion time"
             index = wait_for(
                 lambda: (i + 1 if (i := reader.index(inactive_list, executable)) >= 0 else None),
                 "test app in inactive panel",
@@ -338,6 +348,7 @@ def main():
             assert reader.index(inactive_list, executable) == -1
             assert field_text(tag_edit) == "focus", "Selection was lost when app changed panels"
             assert user32.IsWindowEnabled(save_tag), "Search filtered active app"
+            assert len(records(database, executable)) == 1, "Second run was inserted before exit"
             post(next_window, WM_CLOSE)
             assert next_child.wait(timeout=10) == 0
             wait_for(lambda: len(records(database, executable)) == 2, "second run exit record")
@@ -379,9 +390,26 @@ def main():
             set_field_text(tag_edit, "")
             user32.SendMessageW(reopened, WM_COMMAND, 1104, save_tag)
             assert records(database, executable)[0][4] == "", "Clearing tag did not persist"
+            active_list = user32.GetDlgItem(reopened, 1101)
+            partial_title = f"MinTracker shutdown test app {os.getpid()}"
+            partial = subprocess.Popen([sys.executable, __file__, "--window", partial_title])
+            processes.append(partial)
+            partial_window = wait_for(lambda: user32.FindWindowW(None, partial_title), "shutdown test app")
+            wait_for(lambda: reader.index(active_list, executable) >= 0, "shutdown app discovery")
+            time.sleep(2)
+            assert len(records(database, executable)) == 2, "Running app created a usage record"
+            shutdown_time = datetime.datetime.now(datetime.timezone.utc)
             post(reopened, WM_ENDSESSION, 1)
             assert restarted.wait(timeout=10) == 0
-            print(f"PASS: tracked {stopped[0]} ms; overlap, hide, restore, exit, and persistence verified")
+            assert partial.poll() is None, "Shutdown test app exited unexpectedly"
+            saved = records(database, executable)
+            assert len(saved) == 3 and saved[-1][2] > 0, "Shutdown did not save partial run"
+            timestamp = datetime.datetime.strptime(saved[-1][3], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=datetime.timezone.utc)
+            assert abs((timestamp - shutdown_time).total_seconds()) < 10
+            post(partial_window, WM_CLOSE)
+            assert partial.wait(timeout=10) == 0
+            print(f"PASS: tracked {stopped[0]} ms; exit-only records and shutdown persistence verified")
         finally:
             if reader:
                 reader.close()

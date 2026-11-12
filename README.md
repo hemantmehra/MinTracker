@@ -33,10 +33,10 @@ The window shows each executable's accumulated runtime and runtime for the
 current local calendar day in hours:minutes:seconds. Apps are identified by their executable path; apps
 with the same executable name but different paths are listed separately.
 Multiple windows or processes of the same executable count only once while
-they overlap. Running apps' runtime totals are saved to the database and
-updated in the display approximately every minute, and when the app or
-MinTracker exits. App discovery and active/inactive status still update
-approximately every two seconds.
+they overlap. Running apps' runtime totals are held in memory and updated in
+the display approximately every minute. Usage is saved when all tracked
+processes of an app exit, or when MinTracker exits gracefully. App discovery
+and active/inactive status still update approximately every two seconds.
 The upper panel shows currently tracked apps; the lower panel shows apps that
 have been tracked previously but are no longer running. Select an app in either
 panel, edit its tag in the field below the lists, and select **Save tag**.
@@ -49,10 +49,11 @@ The active list is unaffected. If a selected app is filtered out, its tag
 editor is disabled until the app becomes visible again.
 The `apps.tag` column defaults to an empty string. `daily_usage` stores one
 record per tracked run per local day: a run spanning midnight has a separate
-record for each day, with the same `run_id`. Each record's `duration_ms` grows
-until that run ends (or the day ends), and `add_timestamp` is the UTC time when
-the record was first inserted, in ISO 8601 format. Total runtime is the sum of
-the app's records; today's runtime sums records for the current local date.
+record for each day, with the same `run_id`. Records are inserted when the
+tracked run ends (or MinTracker exits gracefully); `duration_ms` is the time
+for that run on that local day, and `add_timestamp` is the UTC insertion time
+in ISO 8601 format. Total runtime sums completed records and the displayed
+portion of the current run; today's runtime uses the current local date.
 
 Closing the window hides it in the Windows notification area. Depending on
 Windows settings, its icon may be inside the hidden icons menu. Double-click
@@ -68,7 +69,7 @@ missed. Tracking begins when MinTracker first discovers the app, not when the
 app started if it was already running. Apps which cannot be inspected due to
 Windows permissions are excluded. Time is tracked only while MinTracker is
 running; it does not automatically start with Windows. A sudden termination
-may lose up to one minute of runtime.
+loses the unsaved runtime of apps still being tracked.
 
 ## Self-test
 
