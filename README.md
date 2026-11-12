@@ -6,15 +6,18 @@ SQLite library included with Windows.
 
 ## Build
 
-Open a Visual Studio Developer Command Prompt with the C++ desktop workload
-and a Windows SDK installed:
+Install Python 3 and Visual Studio with the **Desktop development with C++**
+workload and a Windows SDK. From the project directory, run:
 
 ```bat
-cmake -S . -B build
-cmake --build build --config Release
+python build.py
 ```
 
-Run `build\Release\MinTracker.exe`. The database is stored at
+The script locates Visual Studio and builds an x64 release executable. If run
+from a Visual Studio Developer Command Prompt, it uses that prompt's configured
+compiler and target architecture instead. No CMake or Python packages are needed.
+
+Run `build\MinTracker.exe`. The database is stored at
 `%LOCALAPPDATA%\MinTracker\usage.db`. No network access is used.
 To use a different database, run `MinTracker.exe --database <path>`; its parent
 directory must already exist. Only one MinTracker instance runs per Windows
