@@ -86,13 +86,13 @@ uint64_t NextMidnight(const SYSTEMTIME& local) {
 }
 
 void AddInterval(Database& db, const std::wstring& path, const std::wstring& name,
-                 uint64_t begin, uint64_t end) {
+                 const std::wstring& runId, uint64_t begin, uint64_t end) {
     while (begin < end) {
         SYSTEMTIME local = LocalAt(begin);
         uint64_t boundary = NextMidnight(local);
         if (boundary <= begin) throw std::runtime_error("Invalid local midnight boundary.");
         uint64_t next = (std::min)(boundary, end);
-        db.Add(path, name, Date(local), static_cast<int64_t>((next - begin) / kTicksPerMs));
+        db.Add(path, name, runId, Date(local), static_cast<int64_t>((next - begin) / kTicksPerMs));
         begin = next;
     }
 }
@@ -117,7 +117,17 @@ struct App {
     std::wstring name;
     uint64_t last;
     std::vector<Process> processes;
+    std::wstring runId;
 };
+
+std::wstring NewRunId() {
+    GUID id{};
+    if (FAILED(CoCreateGuid(&id))) throw std::runtime_error("Could not create app run ID.");
+    wchar_t result[39]{};
+    if (!StringFromGUID2(id, result, static_cast<int>(std::size(result))))
+        throw std::runtime_error("Could not format app run ID.");
+    return result;
+}
 
 class Tracker {
     Database& db_;
@@ -166,8 +176,15 @@ public:
             }
             size_t slash = key.find_last_of(L"\\/");
             std::wstring name(path + (slash == std::wstring::npos ? 0 : slash + 1));
-            auto result = apps_.try_emplace(key, App{name, now, {}});
-            result.first->second.processes.push_back({pid, handle});
+            try {
+                auto it = apps_.find(key);
+                if (it == apps_.end())
+                    it = apps_.emplace(key, App{name, now, {}, NewRunId()}).first;
+                it->second.processes.push_back({pid, handle});
+            } catch (...) {
+                CloseHandle(handle);
+                throw;
+            }
         }
     }
     void Flush(uint64_t now) {
@@ -196,7 +213,7 @@ public:
             for (const auto& update : updates) {
                 const App& app = apps_.at(update.path);
                 if (update.end > app.last)
-                    AddInterval(db_, update.path, app.name, app.last, update.end);
+                    AddInterval(db_, update.path, app.name, app.runId, app.last, update.end);
             }
             db_.Exec("COMMIT");
         } catch (...) {
@@ -410,18 +427,19 @@ int SelfTest() {
     std::wstring first = Date(LocalAt(midnight - 1000 * kTicksPerMs));
     std::wstring second = Date(LocalAt(midnight + 1000 * kTicksPerMs));
     db.Exec("BEGIN IMMEDIATE");
-    AddInterval(db, L"c:\\test\\app.exe", L"app.exe",
+    AddInterval(db, L"c:\\test\\app.exe", L"app.exe", L"run-1",
                 midnight - 2000 * kTicksPerMs, midnight + 3000 * kTicksPerMs);
+    db.Add(L"c:\\test\\app.exe", L"app.exe", L"run-2", second, 1000);
     db.Exec("COMMIT");
     auto before = db.Rows(first);
     auto after = db.Rows(second);
     Require(first != second && before.size() == 1 && after.size() == 1, "Date split failed.");
-    Require(before[0].total == 5000 && before[0].today == 2000 &&
-            after[0].total == 5000 && after[0].today == 3000, "Incorrect usage totals.");
+    Require(before[0].total == 6000 && before[0].today == 2000 &&
+            after[0].total == 6000 && after[0].today == 4000, "Incorrect usage totals.");
     db.Exec("BEGIN IMMEDIATE");
-    db.Add(L"c:\\test\\app.exe", L"app.exe", second, 1000);
+    db.Add(L"c:\\test\\app.exe", L"app.exe", L"run-2", second, 1000);
     db.Exec("ROLLBACK");
-    Require(db.Rows(second)[0].total == 5000, "Transaction rollback failed.");
+    Require(db.Rows(second)[0].total == 6000, "Transaction rollback failed.");
     return 0;
 }
 } // namespace

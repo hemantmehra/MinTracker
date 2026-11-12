@@ -23,6 +23,10 @@ To use a different database, run `MinTracker.exe --database <path>`; its parent
 directory must already exist. Only one MinTracker instance runs per Windows
 user session.
 
+When first opening a database from the previous daily-aggregate schema, this
+version resets its usage history to empty. New databases and databases already
+using the new schema are not reset.
+
 ## Use
 
 The window shows each executable's accumulated runtime and runtime for the
@@ -30,6 +34,12 @@ current local calendar day in hours:minutes:seconds. Apps are identified by thei
 with the same executable name but different paths are listed separately.
 Multiple windows or processes of the same executable count only once while
 they overlap. The display and database update approximately every two seconds.
+The `apps.tag` column defaults to an empty string. `daily_usage` stores one
+record per tracked run per local day: a run spanning midnight has a separate
+record for each day, with the same `run_id`. Each record's `duration_ms` grows
+until that run ends (or the day ends), and `add_timestamp` is the UTC time when
+the record was first inserted, in ISO 8601 format. Total runtime is the sum of
+the app's records; today's runtime sums records for the current local date.
 
 Closing the window hides it in the Windows notification area. Depending on
 Windows settings, its icon may be inside the hidden icons menu. Double-click

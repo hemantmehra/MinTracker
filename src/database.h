@@ -22,6 +22,6 @@ public:
 
     void Exec(const char* sql);
     void Add(const std::wstring& path, const std::wstring& name,
-             const std::wstring& day, int64_t milliseconds);
+             const std::wstring& runId, const std::wstring& day, int64_t milliseconds);
     std::vector<Row> Rows(const std::wstring& day);
 };
