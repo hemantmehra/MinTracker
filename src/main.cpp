@@ -13,13 +13,17 @@
 
 namespace {
 constexpr UINT kTrayMessage = WM_APP + 1;
-constexpr UINT kTimer = 1;
+constexpr UINT kScanTimer = 1;
+constexpr UINT kUsageTimer = 2;
+constexpr UINT kScanIntervalMs = 2000;
+constexpr UINT kUsageIntervalMs = 60000;
 constexpr UINT kOpen = 1001;
 constexpr UINT kExit = 1002;
 constexpr int kActiveList = 1101;
 constexpr int kInactiveList = 1102;
 constexpr int kTagEdit = 1103;
 constexpr int kSaveTag = 1104;
+constexpr int kInactiveSearch = 1105;
 constexpr UINT_PTR kTrayId = 1;
 constexpr uint64_t kTicksPerMs = 10000;
 constexpr uint64_t kTicksPerDay = 864000000000ULL;
@@ -194,16 +198,18 @@ public:
         }
     }
     bool IsActive(const std::wstring& path) const { return apps_.find(path) != apps_.end(); }
-    void Flush(uint64_t now) {
+    void Flush(uint64_t now, bool includeRunning = true) {
         struct Update { std::wstring path; uint64_t end; std::vector<DWORD> exited; };
         std::vector<Update> updates;
         for (const auto& pair : apps_) {
             uint64_t end = 0;
+            bool running = false;
             std::vector<DWORD> exited;
             for (const auto& process : pair.second.processes) {
                 DWORD status = WaitForSingleObject(process.handle, 0);
                 if (status == WAIT_TIMEOUT) {
                     end = now;
+                    running = true;
                     continue;
                 }
                 if (status != WAIT_OBJECT_0) throw WinError("Could not inspect process");
@@ -213,7 +219,7 @@ public:
                 end = (std::max)(end, (std::min)(FileTimeValue(exit), now));
                 exited.push_back(process.pid);
             }
-            updates.push_back({pair.first, end, std::move(exited)});
+            updates.push_back({pair.first, running && !includeRunning ? 0 : end, std::move(exited)});
         }
         db_.Exec("BEGIN IMMEDIATE");
         try {
@@ -256,6 +262,27 @@ std::wstring FormatDuration(int64_t ms) {
     return result;
 }
 
+std::wstring ControlText(HWND control) {
+    int length = GetWindowTextLengthW(control);
+    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+    int copied = GetWindowTextW(control, &text[0], length + 1);
+    text.resize(static_cast<size_t>(copied));
+    return text;
+}
+
+bool ContainsIgnoreCase(const std::wstring& text, const std::wstring& query) {
+    if (query.empty()) return true;
+    if (text.empty()) return false;
+    SetLastError(ERROR_SUCCESS);
+    int result = FindNLSStringEx(LOCALE_NAME_INVARIANT, FIND_FROMSTART | NORM_IGNORECASE,
+                                text.c_str(), static_cast<int>(text.size()),
+                                query.c_str(), static_cast<int>(query.size()),
+                                nullptr, nullptr, nullptr, 0);
+    if (result >= 0) return true;
+    if (GetLastError() != ERROR_SUCCESS) throw WinError("Could not search app details");
+    return false;
+}
+
 class Application {
     Database db_;
     Tracker tracker_;
@@ -264,6 +291,8 @@ class Application {
     HWND inactiveList_ = nullptr;
     HWND activeLabel_ = nullptr;
     HWND inactiveLabel_ = nullptr;
+    HWND searchLabel_ = nullptr;
+    HWND searchEdit_ = nullptr;
     HWND tagLabel_ = nullptr;
     HWND tagEdit_ = nullptr;
     HWND saveTag_ = nullptr;
@@ -338,16 +367,23 @@ class Application {
     }
     void Refresh() {
         auto rows = db_.Rows(Date(LocalAt(Now())));
+        std::wstring search = ControlText(searchEdit_);
         activeRows_.clear();
         inactiveRows_.clear();
         for (auto& row : rows) {
             if (tracker_.IsActive(row.path)) activeRows_.push_back(std::move(row));
-            else inactiveRows_.push_back(std::move(row));
+            else if (ContainsIgnoreCase(row.name, search) || ContainsIgnoreCase(row.tag, search))
+                inactiveRows_.push_back(std::move(row));
         }
         updatingLists_ = true;
         Populate(activeList_, activeRows_);
         Populate(inactiveList_, inactiveRows_);
         updatingLists_ = false;
+        auto selected = [this](const Row& row) { return hasSelection_ && row.id == selectedId_; };
+        bool visible = std::any_of(activeRows_.begin(), activeRows_.end(), selected) ||
+                       std::any_of(inactiveRows_.begin(), inactiveRows_.end(), selected);
+        EnableWindow(tagEdit_, visible);
+        EnableWindow(saveTag_, visible);
     }
     void SelectRow(HWND list, int index) {
         const auto& rows = list == activeList_ ? activeRows_ : inactiveRows_;
@@ -364,31 +400,33 @@ class Application {
     }
     void SaveTag() {
         if (!hasSelection_) return;
-        int length = GetWindowTextLengthW(tagEdit_);
-        std::wstring tag(static_cast<size_t>(length) + 1, L'\0');
-        int copied = GetWindowTextW(tagEdit_, &tag[0], length + 1);
-        tag.resize(static_cast<size_t>(copied));
-        db_.SetTag(selectedId_, tag);
+        db_.SetTag(selectedId_, ControlText(tagEdit_));
         Refresh();
     }
     void Layout(int width, int height) {
-        if (!activeList_ || !inactiveList_ || !tagEdit_) return;
+        if (!activeList_ || !inactiveList_ || !tagEdit_ || !searchEdit_) return;
         int contentWidth = (std::max)(0, width - 16);
-        int panelHeight = (std::max)(0, (height - 110) / 2);
+        int panelHeight = (std::max)(0, (height - 140) / 2);
         MoveWindow(activeLabel_, 8, 8, contentWidth, 20, TRUE);
         MoveWindow(activeList_, 8, 28, contentWidth, panelHeight, TRUE);
         int second = 36 + panelHeight;
         MoveWindow(inactiveLabel_, 8, second, contentWidth, 20, TRUE);
-        MoveWindow(inactiveList_, 8, second + 20, contentWidth, panelHeight, TRUE);
-        int bottom = second + 28 + panelHeight;
+        MoveWindow(searchLabel_, 8, second + 25, 50, 20, TRUE);
+        MoveWindow(searchEdit_, 60, second + 20, (std::max)(0, width - 68), 26, TRUE);
+        MoveWindow(inactiveList_, 8, second + 50, contentWidth, panelHeight, TRUE);
+        int bottom = second + 58 + panelHeight;
         MoveWindow(tagLabel_, 8, bottom + 4, 30, 20, TRUE);
         MoveWindow(tagEdit_, 40, bottom, (std::max)(0, width - 140), 26, TRUE);
         MoveWindow(saveTag_, (std::max)(40, width - 92), bottom, 84, 26, TRUE);
     }
-    void Tick() {
+    void Scan() {
         uint64_t now = Now();
-        tracker_.Flush(now);
+        tracker_.Flush(now, false);
         tracker_.Scan(now);
+        Refresh();
+    }
+    void UpdateUsage() {
+        tracker_.Flush(Now());
         Refresh();
     }
     void Show() {
@@ -419,6 +457,11 @@ class Application {
             activeList_ = CreateList(kActiveList);
             inactiveLabel_ = CreateWindowW(L"STATIC", L"Inactive apps", WS_CHILD | WS_VISIBLE,
                 0, 0, 0, 0, window_, nullptr, instance, nullptr);
+            searchLabel_ = CreateWindowW(L"STATIC", L"Search:", WS_CHILD | WS_VISIBLE,
+                0, 0, 0, 0, window_, nullptr, instance, nullptr);
+            searchEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInactiveSearch)), instance, nullptr);
             inactiveList_ = CreateList(kInactiveList);
             tagLabel_ = CreateWindowW(L"STATIC", L"Tag:", WS_CHILD | WS_VISIBLE,
                 0, 0, 0, 0, window_, nullptr, instance, nullptr);
@@ -427,10 +470,11 @@ class Application {
                 0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTagEdit)), instance, nullptr);
             saveTag_ = CreateWindowW(L"BUTTON", L"Save tag", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                 0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveTag)), instance, nullptr);
-            if (!activeLabel_ || !inactiveLabel_ || !tagLabel_ || !tagEdit_ || !saveTag_)
+            if (!activeLabel_ || !inactiveLabel_ || !searchLabel_ || !searchEdit_ ||
+                !tagLabel_ || !tagEdit_ || !saveTag_)
                 throw WinError("Could not create app controls");
             HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-            for (HWND control : {activeLabel_, activeList_, inactiveLabel_, inactiveList_,
+            for (HWND control : {activeLabel_, activeList_, inactiveLabel_, searchLabel_, searchEdit_, inactiveList_,
                                  tagLabel_, tagEdit_, saveTag_})
                 SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
             EnableWindow(tagEdit_, FALSE);
@@ -439,8 +483,11 @@ class Application {
             GetClientRect(window_, &client);
             Layout(client.right, client.bottom);
             AddTray();
-            Tick();
-            if (!SetTimer(window_, kTimer, 2000, nullptr)) throw WinError("Could not start tracking timer");
+            Scan();
+            if (!SetTimer(window_, kScanTimer, kScanIntervalMs, nullptr))
+                throw WinError("Could not start app discovery timer");
+            if (!SetTimer(window_, kUsageTimer, kUsageIntervalMs, nullptr))
+                throw WinError("Could not start usage update timer");
             return 0;
         }
         case WM_SIZE:
@@ -474,9 +521,12 @@ class Application {
         }
         case WM_COMMAND:
             if (LOWORD(wparam) == kSaveTag && HIWORD(wparam) == BN_CLICKED) SaveTag();
+            else if (LOWORD(wparam) == kInactiveSearch && HIWORD(wparam) == EN_CHANGE && searchEdit_)
+                Refresh();
             return 0;
         case WM_TIMER:
-            if (wparam == kTimer) Tick();
+            if (wparam == kScanTimer) Scan();
+            else if (wparam == kUsageTimer) UpdateUsage();
             return 0;
         case kTrayMessage:
             if (lparam == WM_LBUTTONDBLCLK) Show();
@@ -491,7 +541,8 @@ class Application {
             if (wparam) DestroyWindow(window_);
             return 0;
         case WM_DESTROY:
-            KillTimer(window_, kTimer);
+            KillTimer(window_, kScanTimer);
+            KillTimer(window_, kUsageTimer);
             tracker_.Flush(Now());
             if (tray_) { Shell_NotifyIconW(NIM_DELETE, &icon_); tray_ = false; }
             PostQuitMessage(0);
@@ -514,7 +565,8 @@ class Application {
             MessageBoxW(window, ErrorMessage(error.what()).c_str(), L"MinTracker error", MB_OK | MB_ICONERROR);
             if (message == WM_CREATE) return -1;
             if (message == WM_DESTROY) { PostQuitMessage(1); return 0; }
-            KillTimer(window, kTimer);
+            KillTimer(window, kScanTimer);
+            KillTimer(window, kUsageTimer);
             if (app->tray_) { Shell_NotifyIconW(NIM_DELETE, &app->icon_); app->tray_ = false; }
             PostQuitMessage(1);
             return 0;

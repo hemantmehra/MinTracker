@@ -165,6 +165,11 @@ def records(path, executable):
         ).fetchall()
 
 
+def duration_text(milliseconds):
+    seconds = milliseconds // 1000
+    return f"{seconds // 3600}:{seconds // 60 % 60:02}:{seconds % 60:02}"
+
+
 def main():
     exe = Path(sys.argv[1] if len(sys.argv) > 1 else r"build\MinTracker.exe").resolve()
     if user32.FindWindowW("MinTrackerWindow", None):
@@ -188,6 +193,7 @@ def main():
             db.commit()
         try:
             tracker = subprocess.Popen([exe, "--database", database])
+            started_at = time.monotonic()
             processes.append(tracker)
             window = wait_for(lambda: user32.FindWindowW("MinTrackerWindow", None), "tracker window")
             assert user32.IsWindowVisible(window)
@@ -199,23 +205,36 @@ def main():
             inactive_list = user32.GetDlgItem(window, 1102)
             tag_edit = user32.GetDlgItem(window, 1103)
             save_tag = user32.GetDlgItem(window, 1104)
-            assert active_list and inactive_list and tag_edit and save_tag
+            search = user32.GetDlgItem(window, 1105)
+            assert active_list and inactive_list and tag_edit and save_tag and search
             reader = ListReader(tracker.pid)
             title = f"MinTracker test app {os.getpid()}"
             child = subprocess.Popen([sys.executable, __file__, "--window", title])
             processes.append(child)
             child_window = wait_for(lambda: user32.FindWindowW(None, title), "test app")
             executable = str(Path(sys.executable).resolve())
-            first = wait_for(lambda: usage(database, executable), "usage database record")
-            assert first[0] == first[1] and first[0] > 0
-            first_records = records(database, executable)
-            assert len(first_records) == 1 and first_records[0][4] == ""
-            datetime.datetime.strptime(first_records[0][3], "%Y-%m-%dT%H:%M:%S.%fZ")
             index = wait_for(
                 lambda: (i + 1 if (i := reader.index(active_list, executable)) >= 0 else None),
                 "test app in active panel",
             ) - 1
             assert reader.index(inactive_list, executable) == -1
+            assert reader.text(active_list, index, 1) == "0:00:00"
+            time.sleep(5)
+            assert usage(database, executable) is None, "Runtime was saved before the minute update"
+            index = reader.index(active_list, executable)
+            assert reader.text(active_list, index, 1) == "0:00:00", "Runtime display updated early"
+            first = wait_for(lambda: usage(database, executable), "minute usage update", timeout=75)
+            elapsed = time.monotonic() - started_at
+            assert 58 <= elapsed < 75, f"Unexpected first update time: {elapsed}"
+            assert first[0] == first[1] and 50000 <= first[0] <= 65000
+            first_records = records(database, executable)
+            assert len(first_records) == 1 and first_records[0][4] == ""
+            datetime.datetime.strptime(first_records[0][3], "%Y-%m-%dT%H:%M:%S.%fZ")
+            index = wait_for(
+                lambda: (i + 1 if (i := reader.index(active_list, executable)) >= 0
+                         and reader.text(active_list, i, 1) != "0:00:00" else None),
+                "minute runtime display",
+            ) - 1
             reader.select(active_list, index)
             assert user32.IsWindowEnabled(tag_edit) and user32.IsWindowEnabled(save_tag), "Selection did not enable tag editor"
             assert field_text(tag_edit) == ""
@@ -235,23 +254,32 @@ def main():
             other_window = wait_for(lambda: user32.FindWindowW(None, other_title), "second test app")
             time.sleep(6)
             overlap = usage(database, executable)
-            assert 3000 < overlap[0] - first[0] < 9000, "Overlapping processes counted more than once"
+            assert overlap == first, "Running app updated before the next minute"
 
             post(window, WM_CLOSE)
             wait_for(lambda: not user32.IsWindowVisible(window), "window to hide")
             assert tracker.poll() is None, "Closing the window stopped the tracker"
             post(child_window, WM_CLOSE)
             assert child.wait(timeout=10) == 0
+            time.sleep(3)
+            assert usage(database, executable) == overlap, "Overlapping process exit updated running app"
+            assert reader.index(active_list, executable) >= 0
             second = wait_for(
                 lambda: (row if (row := usage(database, executable)) and row[0] > overlap[0] else None),
-                "tracking remaining process while hidden",
+                "second minute update while hidden",
+                timeout=70,
             )
+            assert 55000 <= second[0] - overlap[0] <= 65000, "Minute or overlap accounting incorrect"
+            index = reader.index(active_list, executable)
+            wait_for(lambda: reader.text(active_list, reader.index(active_list, executable), 1)
+                     == duration_text(second[0]), "second minute runtime display")
             post(other_window, WM_CLOSE)
             assert other.wait(timeout=10) == 0
             final = wait_for(
-                lambda: (row if (row := usage(database, executable)) and row[0] >= second[0] else None),
+                lambda: (row if (row := usage(database, executable)) and row[0] > second[0] else None),
                 "exit accounting",
             )
+            assert final[0] - second[0] < 10000, "Exit accounting included excessive runtime"
             time.sleep(5)
             stopped = usage(database, executable)
             assert stopped[0] >= final[0]
@@ -267,24 +295,59 @@ def main():
             assert reader.index(active_list, executable) == -1
             reader.select(inactive_list, index)
             assert field_text(tag_edit) == "active \u03a9"
+            with closing(sqlite3.connect(database)) as db:
+                db.execute("INSERT INTO apps(path,name,tag) VALUES(?,?,?)",
+                           (r"c:\fixture\editor.exe", "EditorExample.exe", "WorkTopic"))
+                db.execute("INSERT INTO apps(path,name,tag) VALUES(?,?,?)",
+                           (r"c:\fixture\other.exe", "OtherExample.exe", "Personal"))
+                db.commit()
+            set_field_text(search, "EDiToR")
+            assert user32.SendMessageW(inactive_list, LVM_GETITEMCOUNT, 0, 0) == 1
+            assert reader.index(inactive_list, r"c:\fixture\editor.exe") >= 0
+            assert not user32.IsWindowEnabled(save_tag), "Filtered selection remains editable"
+            assert field_text(tag_edit) == "active \u03a9", "Search lost tag draft"
+            set_field_text(search, "wORKtOP")
+            assert user32.SendMessageW(inactive_list, LVM_GETITEMCOUNT, 0, 0) == 1
+            assert reader.index(inactive_list, r"c:\fixture\editor.exe") >= 0
+            set_field_text(search, "\u03c9")
+            assert reader.index(inactive_list, executable) >= 0, "Unicode tag did not match case-insensitively"
+            assert user32.IsWindowEnabled(save_tag)
+            set_field_text(search, Path(executable).name.upper())
+            assert reader.index(inactive_list, executable) >= 0, "App name did not match case-insensitively"
+            set_field_text(search, "no-such-app-or-tag")
+            assert user32.SendMessageW(inactive_list, LVM_GETITEMCOUNT, 0, 0) == 0
+            time.sleep(3)
+            assert user32.SendMessageW(inactive_list, LVM_GETITEMCOUNT, 0, 0) == 0, "Refresh cleared filter"
+            set_field_text(search, "")
+            assert reader.index(inactive_list, executable) >= 0
+            assert reader.index(inactive_list, r"c:\fixture\other.exe") >= 0
+            assert user32.IsWindowEnabled(save_tag)
             set_field_text(tag_edit, "focus")
             user32.SendMessageW(window, WM_COMMAND, 1104, save_tag)
             wait_for(lambda: records(database, executable)[0][4] == "focus", "inactive tag save")
 
+            set_field_text(search, "no-such-app-or-tag")
             next_title = f"MinTracker later test app {os.getpid()}"
             next_child = subprocess.Popen([sys.executable, __file__, "--window", next_title])
             processes.append(next_child)
             next_window = wait_for(lambda: user32.FindWindowW(None, next_title), "later test app")
-            wait_for(lambda: len(records(database, executable)) == 2, "second run record")
             index = wait_for(
                 lambda: (i + 1 if (i := reader.index(active_list, executable)) >= 0 else None),
                 "restarted app in active panel",
             ) - 1
             assert reader.index(inactive_list, executable) == -1
             assert field_text(tag_edit) == "focus", "Selection was lost when app changed panels"
+            assert user32.IsWindowEnabled(save_tag), "Search filtered active app"
             post(next_window, WM_CLOSE)
             assert next_child.wait(timeout=10) == 0
-            time.sleep(5)
+            wait_for(lambda: len(records(database, executable)) == 2, "second run exit record")
+            time.sleep(3)
+            assert reader.index(inactive_list, executable) == -1, "Exited app ignored search"
+            assert not user32.IsWindowEnabled(save_tag)
+            set_field_text(search, "FOC")
+            assert reader.index(inactive_list, executable) >= 0
+            assert user32.IsWindowEnabled(save_tag)
+            set_field_text(search, "")
             new_records = records(database, executable)
             assert len(new_records) == 2 and new_records[0][0] != new_records[1][0]
             assert all(row[2] > 0 and row[4] == "focus" for row in new_records)

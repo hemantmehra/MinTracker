@@ -33,13 +33,20 @@ The window shows each executable's accumulated runtime and runtime for the
 current local calendar day in hours:minutes:seconds. Apps are identified by their executable path; apps
 with the same executable name but different paths are listed separately.
 Multiple windows or processes of the same executable count only once while
-they overlap. The display and database update approximately every two seconds.
+they overlap. Running apps' runtime totals are saved to the database and
+updated in the display approximately every minute, and when the app or
+MinTracker exits. App discovery and active/inactive status still update
+approximately every two seconds.
 The upper panel shows currently tracked apps; the lower panel shows apps that
 have been tracked previously but are no longer running. Select an app in either
 panel, edit its tag in the field below the lists, and select **Save tag**.
 Clear the field and save to remove a tag. Tags are associated with executable
 paths and persist across runs. The path column distinguishes apps with the
 same name.
+Use **Search** above the inactive list to filter it by a case-insensitive
+substring of the app name or tag; clearing the search shows all inactive apps.
+The active list is unaffected. If a selected app is filtered out, its tag
+editor is disabled until the app becomes visible again.
 The `apps.tag` column defaults to an empty string. `daily_usage` stores one
 record per tracked run per local day: a run spanning midnight has a separate
 record for each day, with the same `run_id`. Each record's `duration_ms` grows
@@ -61,7 +68,7 @@ missed. Tracking begins when MinTracker first discovers the app, not when the
 app started if it was already running. Apps which cannot be inspected due to
 Windows permissions are excluded. Time is tracked only while MinTracker is
 running; it does not automatically start with Windows. A sudden termination
-may lose up to one update interval.
+may lose up to one minute of runtime.
 
 ## Self-test
 
